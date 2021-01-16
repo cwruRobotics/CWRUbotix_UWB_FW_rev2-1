@@ -40,7 +40,11 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct ranging_data_struct {
+  uint16_t anchor_id;
+  float distance;
+  uint16_t confidence;
+}RangingData_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -82,7 +86,7 @@ CONFIG_FIELD_TYPE self_config[FIELD_SIZE*NUM_FIELDS]; 	// configuration for ours
 extern AnchorData* anchor_data;
 extern TagData* tag_data;
 extern uint8_t UserRxBufferFS[];
-extern uint8_t UserTxBufferFS[];
+uint8_t UserTxBufferFS[INPUT_BUFFER_SIZE];
 state_t 		state 		= IDLE;
 HAL_StatusTypeDef 	UART_status;
 HAL_StatusTypeDef 	uart2_status; 	// status of uart2
@@ -94,6 +98,17 @@ int packet_len 	= 0; 			// length of received packet
 int packet_rcvd 	= 0; 			// indicate if packet has been received and how to process it
 uint8_t send_buf[SEND_BUF_SIZE]; 	// lorge buffer for response packet
 int usb_ind = 0;
+
+/* Definitions for debug_bin_sem */
+osSemaphoreId_t sendCanUpdateBinSemHandle;
+const osSemaphoreAttr_t sendCanUpdateBinSem_attributes = {
+  .name = "sendCanUpdateBinSem"
+};
+/* Definitions for dataQueue */
+osMessageQueueId_t rangingDataQueueHandle;
+const osMessageQueueAttr_t rangingDataQueue_attributes = {
+  .name = "rangingDataQueue"
+};
 
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
@@ -109,6 +124,11 @@ const osThreadAttr_t ioTask_attributes = {
   .name = "ioTask",
   .priority = (osPriority_t) osPriorityLow,
   .stack_size = 128 * 4
+};
+/* Definitions for dataQueue */
+osMessageQueueId_t dataQueueHandle;
+const osMessageQueueAttr_t dataQueue_attributes = {
+  .name = "dataQueue"
 };
 /* Definitions for rangingTimer */
 osTimerId_t rangingTimerHandle;
@@ -159,7 +179,7 @@ uint32_t get_self_id();
 void StartDefaultTask(void *argument);
 void StartIoTask(void *argument);
 void rangingTimerCallback(void *argument);
-void broadcastTimerCallback(void *argument);
+void boadcastTimerCallback(void *argument);
 void rngTimeoutCallback(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -196,6 +216,7 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
+  sendCanUpdateBinSemHandle = osSemaphoreNew(1, 1, &sendCanUpdateBinSem_attributes);
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* Create the timer(s) */
@@ -203,7 +224,7 @@ void MX_FREERTOS_Init(void) {
   rangingTimerHandle = osTimerNew(rangingTimerCallback, osTimerPeriodic, NULL, &rangingTimer_attributes);
 
   /* creation of broadcastTimer */
-  broadcastTimerHandle = osTimerNew(broadcastTimerCallback, osTimerPeriodic, NULL, &broadcastTimer_attributes);
+  broadcastTimerHandle = osTimerNew(boadcastTimerCallback, osTimerPeriodic, NULL, &broadcastTimer_attributes);
 
   /* creation of rangingTimeoutTimer */
   rangingTimeoutTimerHandle = osTimerNew(rngTimeoutCallback, osTimerOnce, NULL, &rangingTimeoutTimer_attributes);
@@ -212,8 +233,13 @@ void MX_FREERTOS_Init(void) {
   /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
 
+  /* Create the queue(s) */
+  /* creation of dataQueue */
+  dataQueueHandle = osMessageQueueNew (16, sizeof(uint32_t), &dataQueue_attributes);
+
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  rangingDataQueueHandle = osMessageQueueNew (8, sizeof(RangingData_t), &rangingDataQueue_attributes);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -245,6 +271,7 @@ void StartDefaultTask(void *argument)
   state_data.tags = tag_data;
   init_field_memory(self_config); // set everything to defaults
   read_config_from_eeprom(self_config); 	// pull any existing values from flash
+  state_data.self_id = (uint16_t)get_self_id(); // id set by DIP switches
   init_from_config(self_config, &config, &state_data); // inititalize the DWM1000 from our fields
 
   osDelay(state_data.self_id * 10); // stagger startup times
@@ -326,6 +353,15 @@ void StartDefaultTask(void *argument)
               anchor->distance = state_data.distance;
               sprintf(debug_text, "Distance to anchor %d is %.3f\r\n", anchor->id, anchor->distance);
               debug_put(debug_text);
+
+              if(osMessageQueueGetSpace(rangingDataQueueHandle) > 0){
+                RangingData_t data = {
+                  .anchor_id = anchor->id,
+                  .distance = state_data.distance,
+                  .confidence = 0
+                };
+                osMessageQueuePut(rangingDataQueueHandle, &data, 0, 0);
+              }
 
               set_state_tag_idle(&state_data); 		// back to idle state
 
@@ -510,7 +546,27 @@ void StartIoTask(void *argument)
   osDelay(100);
   for(;;)
   {
+    // see if it's time to send an update over CAN
+    RangingData_t rng_data;
+    while(osMessageQueueGet(rangingDataQueueHandle, &rng_data, NULL, 0) == osOK){
+      CAN_TxHeaderTypeDef hddr;
+      uint32_t mailbox;
+      uint8_t data[8];
+      hddr.StdId  = self_can_id;
+      hddr.IDE    = CAN_ID_STD;
+      hddr.RTR    = CAN_RTR_DATA;
+      hddr.DLC    = 8;
+      int i = 0;
+      data[i++]   = (uint8_t)(rng_data.anchor_id >> 8);
+      data[i++]   = (uint8_t)(rng_data.anchor_id & 0xFF);
+      memcpy(data + i, &(rng_data.distance), sizeof(rng_data.distance));
+      i += sizeof(rng_data.distance);
+      data[i++]   = (uint8_t)(rng_data.confidence >> 8);
+      data[i++]   = (uint8_t)(rng_data.confidence & 0xFF);
+      HAL_CAN_AddTxMessage(&hcan, &hddr, data, &mailbox);
+    }
 
+    // see if we've received anything over CAN
     uint32_t can_frame_available = HAL_CAN_GetRxFifoFillLevel(&hcan, CAN_RX_FIFO0);
 
 	  if(can_frame_available > 0){
@@ -524,7 +580,6 @@ void StartIoTask(void *argument)
       CAN_LED_GPIO_Port->ODR &= ~CAN_LED_Pin;
 	  }
 
-
     if(debug_buf_offset > 0){
       HAL_UART_Transmit(&huart1, debug_buf, debug_buf_offset, 5);
       debug_buf_offset = 0;
@@ -532,40 +587,21 @@ void StartIoTask(void *argument)
     // ---- check Interfaces for data ----
 	  uart2_status = HAL_UART_Receive(&huart1, packet, HDDR_LEN, 1);
 		if((packet_type = packet[0]) != 0 && uart2_status == HAL_OK){
-			HAL_GPIO_WritePin(RX_LED_GPIO_Port, RX_LED_Pin, GPIO_PIN_SET);
 			packet_len = HDDR_LEN + packet[1] + 1; 	// get the packet length
 
 			if(packet_len > INPUT_BUFFER_SIZE)
 				packet_len = INPUT_BUFFER_SIZE; // clamp packet_len just in case
 
 			// read the packet
-			uart2_status = HAL_UART_Receive(&huart2, packet + HDDR_LEN, packet[1] + 1, INPUT_TIMEOUT);
+			uart2_status = HAL_UART_Receive(&huart1, packet + HDDR_LEN, packet[1] + 1, INPUT_TIMEOUT);
 
 			// if all is well
 			if(uart2_status == HAL_OK && packet[packet_len - 1] == STOP_BYTE){
 				packet_rcvd = IF_TYPE_UART;
 			}
 
-			HAL_GPIO_WritePin(RX_LED_GPIO_Port, RX_LED_Pin, GPIO_PIN_RESET);
 
-		}else if(osSemaphoreAcquire(usbDataReadySemHandle, 1) == osOK && (packet_type = UserRxBufferFS[0]) != 0){
-      // debug_put("USB data\r\n");
-			HAL_GPIO_WritePin(RX_LED_GPIO_Port, RX_LED_Pin, GPIO_PIN_SET);
-			packet_len 	= UserRxBufferFS[1] + HDDR_LEN + 1;
-
-			if(packet_len > INPUT_BUFFER_SIZE)
-				packet_len = INPUT_BUFFER_SIZE; // clamp packet_len just in case
-
-			if(UserRxBufferFS[packet_len - 1] == STOP_BYTE){
-				packet_rcvd = IF_TYPE_USB;
-				memcpy(packet, UserRxBufferFS, packet_len);
-			}
-
-			// memset(UserRxBufferFS, 0, packet_len);
-      UserRxBufferFS[0] = 0;
-
-			HAL_GPIO_WritePin(RX_LED_GPIO_Port, RX_LED_Pin, GPIO_PIN_RESET);
-    }
+		}
 
     // ---- if received, process the data ----
     if(packet_rcvd > 0){
@@ -591,21 +627,7 @@ void StartIoTask(void *argument)
       }
       int send_size = HDDR_LEN + UserTxBufferFS[1] + 1;
       switch(packet_rcvd){
-      case IF_TYPE_UART:{
-        HAL_GPIO_WritePin(TX_LED_GPIO_Port, TX_LED_Pin, GPIO_PIN_SET);
-        uart2_status = HAL_UART_Transmit(&huart2, UserTxBufferFS, send_size, INPUT_TIMEOUT);
-        HAL_GPIO_WritePin(TX_LED_GPIO_Port, TX_LED_Pin, GPIO_PIN_RESET);
-        break;}
-      case IF_TYPE_USB:{
-        HAL_GPIO_WritePin(TX_LED_GPIO_Port, TX_LED_Pin, GPIO_PIN_SET);
-        if(CDC_Transmit_FS(UserTxBufferFS, send_size) != USBD_OK){
-          debug_put("Couldn't transmit over USB\r\n");
-        }
-        HAL_GPIO_WritePin(TX_LED_GPIO_Port, TX_LED_Pin, GPIO_PIN_RESET);
-        break;}
-      default:{
-        break;}
-      }
+      uart2_status = HAL_UART_Transmit(&huart1, UserTxBufferFS, send_size, INPUT_TIMEOUT);
       packet_rcvd = 0; // reset this flag
     }
     // debug_put("USER IO LOOP\r\n");
@@ -622,12 +644,12 @@ void rangingTimerCallback(void *argument)
   /* USER CODE END rangingTimerCallback */
 }
 
-/* broadcastTimerCallback function */
-void broadcastTimerCallback(void *argument)
+/* boadcastTimerCallback function */
+void boadcastTimerCallback(void *argument)
 {
-  /* USER CODE BEGIN broadcastTimerCallback */
-  osSemaphoreRelease(doBroadcastHandle);
-  /* USER CODE END broadcastTimerCallback */
+  /* USER CODE BEGIN boadcastTimerCallback */
+
+  /* USER CODE END boadcastTimerCallback */
 }
 
 /* rngTimeoutCallback function */

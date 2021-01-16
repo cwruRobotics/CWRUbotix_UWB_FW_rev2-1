@@ -2,6 +2,7 @@
 Mcu.Family=STM32F1
 ProjectManager.MainLocation=Core/Src
 RCC.MCOFreq_Value=72000000
+FREERTOS.Queues01=dataQueue,16,uint32_t,0,Dynamic,NULL,NULL
 PB13.GPIOParameters=GPIO_PuPd,GPIO_Label
 PA6.Mode=Full_Duplex_Master
 FREERTOS.BinarySemaphores01=dw_irq_sem,Dynamic,NULL;debug_bin_sem,Dynamic,NULL;doRanging,Dynamic,NULL;doBroadcast,Dynamic,NULL;timeoutSem,Dynamic,NULL
@@ -52,7 +53,7 @@ Mcu.Pin7=PB2
 VP_TIM2_VS_ClockSourceINT.Signal=TIM2_VS_ClockSourceINT
 Mcu.Pin8=PB10
 Mcu.Pin9=PB12
-FREERTOS.IPParameters=Tasks01,FootprintOK,Timers01,BinarySemaphores01
+FREERTOS.IPParameters=Tasks01,FootprintOK,Timers01,BinarySemaphores01,Queues01
 RCC.AHBFreq_Value=72000000
 PB13.Locked=true
 Mcu.Pin0=PD0-OSC_IN
